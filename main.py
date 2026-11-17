@@ -2,6 +2,9 @@ import os
 import sys
 import glob
 import shutil
+import subprocess
+import tempfile
+import json
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
@@ -53,6 +56,10 @@ class PivotFixerApp:
         self._offset_timer = None
         self._is_updating_ui = False
         self._current_selected_items = ()
+        
+        self.aseprite_path = tk.StringVar(value="")
+        self.aseprite_files = []
+        self.ase_selection_state = {}
         
         # 변수 변경 시 자동 저장 트리거 연결
         self.offset_y.trace_add("write", self._on_offset_change)
@@ -204,6 +211,11 @@ class PivotFixerApp:
         settings_menu.add_checkbutton(label="항상 맨 위에 띄우기", variable=self.is_always_on_top, command=self.toggle_always_on_top)
         settings_menu.add_separator()
         settings_menu.add_command(label="창 투명도 조절...", command=self.show_transparency_dialog)
+
+        # Aseprite 메뉴
+        aseprite_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="🎨 Aseprite", menu=aseprite_menu)
+        aseprite_menu.add_command(label="Aseprite 연동 도구 열기...", command=self.show_aseprite_tools)
 
         # 도움말 메뉴
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -377,8 +389,13 @@ class PivotFixerApp:
         
         ttk.Label(frame_actions, text="[ 메인 작업 실행 ]", font=("Malgun Gothic", 9, "bold")).pack(side="top", fill="x", pady=(0, 5))
         
-        ttk.Button(frame_actions, text="▶ 체크된 파일 일괄 처리 시작", style="Success.TButton", command=self.run_batch).pack(side="top", fill="x", pady=(0, 5))
-        ttk.Button(frame_actions, text="🌐 모든 파일에 현재설정 덮어쓰기", style="Primary.TButton", command=self.apply_settings_to_all).pack(side="top", fill="x", pady=(0, 5))
+        ttk.Button(frame_actions, text="▶ 체크된 파일 일괄 처리 시작", style="Success.TButton", command=self.run_batch).pack(side="top", fill="x", pady=(0, 2))
+        
+        btn_sub_frame = ttk.Frame(frame_actions, style="Panel.TFrame")
+        btn_sub_frame.pack(side="top", fill="x", pady=(0, 2))
+        ttk.Button(btn_sub_frame, text="🌐 모든 파일에 현재설정 덮어쓰기", style="Primary.TButton", command=self.apply_settings_to_all).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        ttk.Button(btn_sub_frame, text="🎨 Aseprite 도구 열기", command=self.show_aseprite_tools).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        
         self.btn_undo = ttk.Button(frame_actions, text="↩ 마지막 작업 되돌리기", command=self.undo_batch)
         self.btn_undo.pack(side="top", fill="x")
 
@@ -1137,11 +1154,2442 @@ class PivotFixerApp:
         self.last_generated_files.clear()
         messagebox.showinfo("되돌리기 완료", f"{count}개의 파일이 안전하게 삭제되었습니다. 🗑️")
 
+    # ------------------ Aseprite 연동 기능 ------------------
+
+    def get_settings_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "pivot_fixer_settings.json")
+
+    def load_app_settings(self):
+        path = self.get_settings_path()
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except: pass
+        return {}
+
+    def save_app_settings(self, settings):
+        path = self.get_settings_path()
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=4)
+        except: pass
+
+    def validate_aseprite_path(self, path):
+        if not path or not os.path.exists(path) or not path.lower().endswith('.exe'):
+            return False
+        return True
+
+    def auto_detect_aseprite_path(self):
+        settings = self.load_app_settings()
+        if "aseprite_path" in settings and self.validate_aseprite_path(settings["aseprite_path"]):
+            self.aseprite_path.set(settings["aseprite_path"])
+            return
+
+        candidates = [
+            shutil.which("aseprite"),
+            shutil.which("aseprite.exe"),
+            "C:/Program Files/Aseprite/Aseprite.exe",
+            "C:/Program Files (x86)/Aseprite/Aseprite.exe",
+            "C:/Program Files (x86)/Steam/steamapps/common/Aseprite/Aseprite.exe",
+            "C:/Program Files/Steam/steamapps/common/Aseprite/Aseprite.exe"
+        ]
+        for c in candidates:
+            if c and self.validate_aseprite_path(c):
+                self.aseprite_path.set(c)
+                settings["aseprite_path"] = c
+                self.save_app_settings(settings)
+                return
+
+    def find_aseprite_exe(self):
+        path = filedialog.askopenfilename(title="Aseprite.exe 실행 파일 선택", filetypes=[("Executable", "*.exe")])
+        if path:
+            self.aseprite_path.set(path)
+            settings = self.load_app_settings()
+            settings["aseprite_path"] = path
+            self.save_app_settings(settings)
+
+    def run_aseprite_cli(self, args):
+        exe_path = self.aseprite_path.get()
+        if not self.validate_aseprite_path(exe_path):
+            messagebox.showerror("오류", "유효한 Aseprite.exe 경로가 설정되지 않았습니다.")
+            return False, "Invalid Aseprite path"
+        
+        cmd = [exe_path, "-b"] + args
+        try:
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                
+            result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo)
+            if result.returncode != 0:
+                print(f"Aseprite CLI Error: {result.stderr}")
+                return False, result.stderr
+            return True, result.stdout
+        except Exception as e:
+            print(f"Aseprite CLI Exception: {e}")
+            return False, str(e)
+
+    def create_temp_lua_script(self, content):
+        fd, path = tempfile.mkstemp(suffix=".lua", text=True)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return path
+
+    def create_aseprite_inspect_lua(self):
+        content = """
+local app = app
+local sprite = app.activeSprite
+if not sprite then return end
+
+local function get_layers(layer, prefix, result)
+    for _, l in ipairs(layer.layers) do
+        local path = prefix .. l.name
+        table.insert(result, {name=l.name, path=path, isGroup=l.isGroup, isVisible=l.isVisible})
+        if l.isGroup then
+            get_layers(l, path .. "/", result)
+        end
+    end
+end
+
+local layers = {}
+for _, l in ipairs(sprite.layers) do
+    local path = l.name
+    table.insert(layers, {name=l.name, path=path, isGroup=l.isGroup, isVisible=l.isVisible})
+    if l.isGroup then
+        get_layers(l, path .. "/", layers)
+    end
+end
+
+local tags = {}
+for _, t in ipairs(sprite.tags) do
+    table.insert(tags, {name=t.name, fromFrame=t.fromFrame.frameNumber, toFrame=t.toFrame.frameNumber})
+end
+
+local data = {
+    width = sprite.width,
+    height = sprite.height,
+    frames = #sprite.frames,
+    layers = layers,
+    tags = tags
+}
+
+local function to_json(val)
+    local t = type(val)
+    if t == "number" or t == "boolean" then
+        return tostring(val)
+    elseif t == "string" then
+        return '"' .. val:gsub('"', '\\"') .. '"'
+    elseif t == "table" then
+        local is_dict = false
+        for k, v in pairs(val) do
+            if type(k) == "string" then is_dict = true break end
+        end
+        if is_dict then
+            local items = {}
+            for k, v in pairs(val) do
+                table.insert(items, '"' .. k .. '":' .. to_json(v))
+            end
+            return "{" .. table.concat(items, ",") .. "}"
+        else
+            local items = {}
+            for _, v in ipairs(val) do
+                table.insert(items, to_json(v))
+            end
+            return "[" .. table.concat(items, ",") .. "]"
+        end
+    else
+        return "null"
+    end
+end
+
+local out_path = app.params["output_path"]
+if out_path then
+    local f = io.open(out_path, "w")
+    f:write(to_json(data))
+    f:close()
+end
+"""
+        return self.create_temp_lua_script(content)
+
+    def inspect_aseprite_file(self, path):
+        if not self.validate_aseprite_path(self.aseprite_path.get()): return None
+        script = self.create_aseprite_inspect_lua()
+        fd, out_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            args = [path, "--script-param", f"output_path={out_path}", "--script", script]
+            ok, _ = self.run_aseprite_cli(args)
+            if ok and os.path.exists(out_path):
+                with open(out_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            return None
+        except:
+            return None
+        finally:
+            if os.path.exists(script): os.remove(script)
+            if os.path.exists(out_path): os.remove(out_path)
+
+    def export_aseprite_preview_png(self, path, frame=1):
+        if not self.validate_aseprite_path(self.aseprite_path.get()): return None
+        import tempfile, glob
+        from PIL import Image
+        
+        tmp_dir = tempfile.mkdtemp(prefix="pivot_ase_preview_")
+        out_path = os.path.join(tmp_dir, "preview.png")
+
+        candidates = []
+        candidates.append(max(0, int(frame) - 1))
+        candidates.append(max(0, int(frame)))
+
+        for idx in candidates:
+            # 이전 시도 파일 정리
+            for old in glob.glob(os.path.join(tmp_dir, "*.png")):
+                try:
+                    os.remove(old)
+                except:
+                    pass
+
+            args = [path, "--frame-range", f"{idx},{idx}", "--save-as", out_path]
+            ok, log = self.run_aseprite_cli(args)
+
+            pngs = glob.glob(os.path.join(tmp_dir, "*.png"))
+            valid_pngs = []
+            for p in pngs:
+                try:
+                    if os.path.exists(p) and os.path.getsize(p) > 0:
+                        with Image.open(p) as tmp_img:
+                            tmp_img.verify()
+                        valid_pngs.append(p)
+                except Exception as e:
+                    print(f"미리보기 PNG 검증 실패: {p} / {e}")
+
+            if valid_pngs:
+                return valid_pngs[0]
+
+            print("[Aseprite Preview Export Failed]")
+            print(f"source: {path}")
+            print(f"requested frame: {frame}")
+            print(f"tried cli frame index: {idx}")
+            print(f"args: {args}")
+            print(f"ok: {ok}")
+            print(f"log: {log}")
+            print(f"tmp_dir files: {[(p, os.path.getsize(p) if os.path.exists(p) else -1) for p in pngs]}")
+
+        return None
+
+    def export_aseprite_preview_png_with_visible_layers(self, path, frame=1, visible_layer_paths=None):
+        if visible_layer_paths is None:
+            return self.export_aseprite_preview_png(path, frame)
+        if not visible_layer_paths:
+            print("[Aseprite Layer Preview Export Skipped] visible layer list is empty")
+            return None
+        if not self.validate_aseprite_path(self.aseprite_path.get()): return None
+
+        import tempfile, glob
+        from PIL import Image
+
+        tmp_dir = tempfile.mkdtemp(prefix="pivot_ase_preview_layers_")
+        out_path = os.path.join(tmp_dir, "preview.png")
+
+        candidates = []
+        candidates.append(max(0, int(frame) - 1))
+        candidates.append(max(0, int(frame)))
+
+        for idx in candidates:
+            for old in glob.glob(os.path.join(tmp_dir, "*.png")):
+                try:
+                    os.remove(old)
+                except:
+                    pass
+
+            args = [path]
+            for layer_path in visible_layer_paths:
+                args += ["--layer", layer_path]
+            args += ["--frame-range", f"{idx},{idx}", "--save-as", out_path]
+            ok, log = self.run_aseprite_cli(args)
+
+            pngs = glob.glob(os.path.join(tmp_dir, "*.png"))
+            valid_pngs = []
+            for p in pngs:
+                try:
+                    if os.path.exists(p) and os.path.getsize(p) > 0:
+                        with Image.open(p) as tmp_img:
+                            tmp_img.verify()
+                        valid_pngs.append(p)
+                except Exception as e:
+                    print(f"레이어 미리보기 PNG 검증 실패: {p} / {e}")
+
+            if valid_pngs:
+                return valid_pngs[0]
+
+            print("[Aseprite Layer Preview Export Failed]")
+            print(f"source: {path}")
+            print(f"visible layers: {list(visible_layer_paths)}")
+            print(f"requested frame: {frame}")
+            print(f"tried cli frame index: {idx}")
+            print(f"args: {args}")
+            print(f"ok: {ok}")
+            print(f"log: {log}")
+            print(f"tmp_dir files: {[(p, os.path.getsize(p) if os.path.exists(p) else -1) for p in pngs]}")
+
+        return None
+
+    def create_aseprite_pivot_analyze_lua(self):
+        content = r'''
+local sprite = app.activeSprite
+if not sprite then return end
+
+local function read_lines(path)
+    local result = {}
+    if not path or path == "" then return result end
+    local file = io.open(path, "r")
+    if not file then return result end
+    for line in file:lines() do
+        if line ~= "" then
+            table.insert(result, line)
+        end
+    end
+    file:close()
+    return result
+end
+
+local function read_layer_set(path)
+    local result = {}
+    for _, line in ipairs(read_lines(path)) do
+        result[line] = true
+    end
+    return result
+end
+
+local function read_frame_ranges(path)
+    local result = {}
+    for _, line in ipairs(read_lines(path)) do
+        local start_text, finish_text = string.match(line, "^(-?%d+),(-?%d+)$")
+        if start_text and finish_text then
+            table.insert(result, {
+                start = tonumber(start_text),
+                finish = tonumber(finish_text)
+            })
+        end
+    end
+    return result
+end
+
+local function json_escape(value)
+    return value
+        :gsub("\\", "\\\\")
+        :gsub('"', '\\"')
+        :gsub("\b", "\\b")
+        :gsub("\f", "\\f")
+        :gsub("\n", "\\n")
+        :gsub("\r", "\\r")
+        :gsub("\t", "\\t")
+end
+
+local function to_json(value)
+    local value_type = type(value)
+    if value_type == "nil" then
+        return "null"
+    elseif value_type == "boolean" or value_type == "number" then
+        return tostring(value)
+    elseif value_type == "string" then
+        return '"' .. json_escape(value) .. '"'
+    elseif value_type == "table" then
+        local is_array = true
+        local max_index = 0
+        for key, _ in pairs(value) do
+            if type(key) ~= "number" or key < 1 or math.floor(key) ~= key then
+                is_array = false
+                break
+            end
+            if key > max_index then max_index = key end
+        end
+
+        local items = {}
+        if is_array then
+            for index = 1, max_index do
+                table.insert(items, to_json(value[index]))
+            end
+            return "[" .. table.concat(items, ",") .. "]"
+        end
+
+        for key, item in pairs(value) do
+            table.insert(items, to_json(tostring(key)) .. ":" .. to_json(item))
+        end
+        return "{" .. table.concat(items, ",") .. "}"
+    end
+    return "null"
+end
+
+local function get_layer_path(layer)
+    local path = layer.name
+    local parent = layer.parent
+    while parent and parent ~= sprite do
+        path = parent.name .. "/" .. path
+        parent = parent.parent
+    end
+    return path
+end
+
+local target_layers = read_layer_set(app.params["layers_path"])
+local frame_ranges = read_frame_ranges(app.params["ranges_path"])
+local target_frame_mode = app.params["target_frame_mode"] or "all"
+local offset_x = tonumber(app.params["offset_x"]) or 0
+local offset_y = tonumber(app.params["offset_y"]) or 0
+
+local function frame_is_target(frame_number)
+    if target_frame_mode == "all" then return true end
+    for _, range in ipairs(frame_ranges) do
+        if frame_number >= range.start and frame_number <= range.finish then
+            return true
+        end
+    end
+    return false
+end
+
+local target_leaf_layers = {}
+local function collect_target_layers(layer)
+    if layer.isGroup then
+        for _, child in ipairs(layer.layers) do
+            collect_target_layers(child)
+        end
+    else
+        local path = get_layer_path(layer)
+        if target_layers[path] then
+            table.insert(target_leaf_layers, layer)
+        end
+    end
+end
+
+for _, layer in ipairs(sprite.layers) do
+    collect_target_layers(layer)
+end
+
+local result = {
+    ok = true,
+    width = sprite.width,
+    height = sprite.height,
+    pivot_x = math.floor(sprite.width / 2) + offset_x,
+    pivot_y = math.floor(sprite.height / 2) - offset_y,
+    total_frames = #sprite.frames,
+    selected_frames = 0,
+    analyzed_frames = 0,
+    skipped_frames = {},
+    per_frame = {},
+    warnings = {}
+}
+
+if #target_leaf_layers == 0 then
+    result.ok = false
+    result.error = "대상 레이어 경로와 일치하는 drawable 레이어가 없습니다."
+end
+
+if result.ok then
+    for _, frame in ipairs(sprite.frames) do
+        local frame_number = frame.frameNumber
+        if frame_is_target(frame_number) then
+            result.selected_frames = result.selected_frames + 1
+            local left = nil
+            local top = nil
+            local right = nil
+            local bottom = nil
+
+            for _, layer in ipairs(target_leaf_layers) do
+                local cel = layer:cel(frame_number)
+                if cel and cel.image and not cel.image:isEmpty() then
+                    local local_bounds = cel.image:shrinkBounds()
+                    if local_bounds and local_bounds.width > 0 and local_bounds.height > 0 then
+                        local cel_left = cel.position.x + local_bounds.x
+                        local cel_top = cel.position.y + local_bounds.y
+                        local cel_right = cel_left + local_bounds.width
+                        local cel_bottom = cel_top + local_bounds.height
+
+                        left = left and math.min(left, cel_left) or cel_left
+                        top = top and math.min(top, cel_top) or cel_top
+                        right = right and math.max(right, cel_right) or cel_right
+                        bottom = bottom and math.max(bottom, cel_bottom) or cel_bottom
+                    end
+                end
+            end
+
+            if left == nil then
+                table.insert(result.skipped_frames, {
+                    frame = frame_number,
+                    reason = "대상 레이어에 표시 가능한 픽셀이 없습니다."
+                })
+            else
+                local bbox_width = right - left
+                local bbox_height = bottom - top
+                local bbox_center_x = left + math.floor(bbox_width / 2)
+                local bbox_bottom_y = bottom
+                local dx = result.pivot_x - bbox_center_x
+                local dy = result.pivot_y - bbox_bottom_y
+                local moved_left = left + dx
+                local moved_top = top + dy
+                local moved_right = right + dx
+                local moved_bottom = bottom + dy
+                local clipped = (
+                    moved_left < 0 or
+                    moved_top < 0 or
+                    moved_right > sprite.width or
+                    moved_bottom > sprite.height
+                )
+                local frame_warnings = {}
+                if clipped then
+                    table.insert(frame_warnings, "이동 후 bbox가 캔버스 밖으로 나갑니다.")
+                end
+
+                table.insert(result.per_frame, {
+                    frame = frame_number,
+                    bbox = {
+                        left = left,
+                        top = top,
+                        right = right,
+                        bottom = bottom,
+                        width = bbox_width,
+                        height = bbox_height
+                    },
+                    bbox_center_x = bbox_center_x,
+                    bbox_bottom_y = bbox_bottom_y,
+                    dx = dx,
+                    dy = dy,
+                    moved_bbox = {
+                        left = moved_left,
+                        top = moved_top,
+                        right = moved_right,
+                        bottom = moved_bottom,
+                        width = bbox_width,
+                        height = bbox_height
+                    },
+                    clipped = clipped,
+                    warnings = frame_warnings
+                })
+                result.analyzed_frames = result.analyzed_frames + 1
+            end
+        end
+    end
+end
+
+if result.ok and result.selected_frames == 0 then
+    result.ok = false
+    result.error = "분석 대상 프레임이 없습니다."
+elseif result.ok and result.analyzed_frames == 0 then
+    result.ok = false
+    result.error = "분석 가능한 bbox가 없습니다."
+end
+
+local output_path = app.params["output_path"]
+if output_path and output_path ~= "" then
+    local output = io.open(output_path, "w")
+    if output then
+        output:write(to_json(result))
+        output:close()
+    end
+end
+'''
+        return self.create_temp_lua_script(content)
+
+    def analyze_aseprite_pivot(self, path, target_layer_paths, target_frame_mode, checked_tags, offset_x=0, offset_y=0):
+        if not self.validate_aseprite_path(self.aseprite_path.get()):
+            return {"ok": False, "error": "유효한 Aseprite 실행 파일 경로가 아닙니다."}
+        if not path or not os.path.exists(path):
+            return {"ok": False, "error": "분석할 Aseprite 파일을 찾을 수 없습니다."}
+        if not target_layer_paths:
+            return {"ok": False, "error": "수정 대상으로 체크된 레이어가 없습니다."}
+        if target_frame_mode == "tags" and not checked_tags:
+            return {"ok": False, "error": "체크된 태그 프레임 범위가 없습니다."}
+
+        script_path = None
+        output_path = None
+        layers_path = None
+        ranges_path = None
+        try:
+            script_path = self.create_aseprite_pivot_analyze_lua()
+
+            fd, output_path = tempfile.mkstemp(suffix=".json")
+            os.close(fd)
+            fd, layers_path = tempfile.mkstemp(suffix=".txt", text=True)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as file:
+                for layer_path in target_layer_paths:
+                    file.write(f"{layer_path}\n")
+            fd, ranges_path = tempfile.mkstemp(suffix=".txt", text=True)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as file:
+                for start, finish in checked_tags:
+                    file.write(f"{int(start)},{int(finish)}\n")
+
+            args = [
+                path,
+                "--script-param", f"output_path={output_path}",
+                "--script-param", f"layers_path={layers_path}",
+                "--script-param", f"ranges_path={ranges_path}",
+                "--script-param", f"target_frame_mode={target_frame_mode}",
+                "--script-param", f"offset_x={int(offset_x)}",
+                "--script-param", f"offset_y={int(offset_y)}",
+                "--script", script_path
+            ]
+            ok, log = self.run_aseprite_cli(args)
+            if not ok:
+                return {"ok": False, "error": f"Aseprite 분석 Lua 실행 실패: {log}"}
+            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                return {"ok": False, "error": "Aseprite 분석 결과 JSON이 생성되지 않았습니다."}
+
+            try:
+                with open(output_path, "r", encoding="utf-8") as file:
+                    return json.load(file)
+            except Exception as e:
+                return {"ok": False, "error": f"분석 결과 JSON 해석 실패: {e}"}
+        except Exception as e:
+            return {"ok": False, "error": f"피봇 분석 중 오류가 발생했습니다: {e}"}
+        finally:
+            for temp_path in (script_path, output_path, layers_path, ranges_path):
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
+
+    def create_aseprite_pivot_apply_lua(self):
+        content = r'''
+local sprite = app.activeSprite
+if not sprite then return end
+
+local function read_lines(path)
+    local result = {}
+    if not path or path == "" then return result end
+    local file = io.open(path, "r")
+    if not file then return result end
+    for line in file:lines() do
+        if line ~= "" then
+            table.insert(result, line)
+        end
+    end
+    file:close()
+    return result
+end
+
+local function read_layer_set(path)
+    local result = {}
+    for _, line in ipairs(read_lines(path)) do
+        result[line] = true
+    end
+    return result
+end
+
+local function read_frame_ranges(path)
+    local result = {}
+    for _, line in ipairs(read_lines(path)) do
+        local start_text, finish_text = string.match(line, "^(-?%d+),(-?%d+)$")
+        if start_text and finish_text then
+            table.insert(result, {
+                start = tonumber(start_text),
+                finish = tonumber(finish_text)
+            })
+        end
+    end
+    return result
+end
+
+local function json_escape(value)
+    return value
+        :gsub("\\", "\\\\")
+        :gsub('"', '\\"')
+        :gsub("\b", "\\b")
+        :gsub("\f", "\\f")
+        :gsub("\n", "\\n")
+        :gsub("\r", "\\r")
+        :gsub("\t", "\\t")
+end
+
+local function to_json(value)
+    local value_type = type(value)
+    if value_type == "nil" then
+        return "null"
+    elseif value_type == "boolean" or value_type == "number" then
+        return tostring(value)
+    elseif value_type == "string" then
+        return '"' .. json_escape(value) .. '"'
+    elseif value_type == "table" then
+        local is_array = true
+        local max_index = 0
+        for key, _ in pairs(value) do
+            if type(key) ~= "number" or key < 1 or math.floor(key) ~= key then
+                is_array = false
+                break
+            end
+            if key > max_index then max_index = key end
+        end
+
+        local items = {}
+        if is_array then
+            for index = 1, max_index do
+                table.insert(items, to_json(value[index]))
+            end
+            return "[" .. table.concat(items, ",") .. "]"
+        end
+
+        for key, item in pairs(value) do
+            table.insert(items, to_json(tostring(key)) .. ":" .. to_json(item))
+        end
+        return "{" .. table.concat(items, ",") .. "}"
+    end
+    return "null"
+end
+
+local function get_layer_path(layer)
+    local path = layer.name
+    local parent = layer.parent
+    while parent and parent ~= sprite do
+        path = parent.name .. "/" .. path
+        parent = parent.parent
+    end
+    return path
+end
+
+local target_layers = read_layer_set(app.params["layers_path"])
+local frame_ranges = read_frame_ranges(app.params["ranges_path"])
+local target_frame_mode = app.params["target_frame_mode"] or "all"
+local offset_x = tonumber(app.params["offset_x"]) or 0
+local offset_y = tonumber(app.params["offset_y"]) or 0
+local output_path = app.params["output_path"]
+
+local function frame_is_target(frame_number)
+    if target_frame_mode == "all" then return true end
+    for _, range in ipairs(frame_ranges) do
+        if frame_number >= range.start and frame_number <= range.finish then
+            return true
+        end
+    end
+    return false
+end
+
+local target_leaf_layers = {}
+local function collect_target_layers(layer)
+    if layer.isGroup then
+        for _, child in ipairs(layer.layers) do
+            collect_target_layers(child)
+        end
+    else
+        local path = get_layer_path(layer)
+        if target_layers[path] then
+            table.insert(target_leaf_layers, layer)
+        end
+    end
+end
+
+local function write_result(result)
+    local out_json = app.params["result_path"]
+    if out_json and out_json ~= "" then
+        local output = io.open(out_json, "w")
+        if output then
+            output:write(to_json(result))
+            output:close()
+        end
+    end
+end
+
+for _, layer in ipairs(sprite.layers) do
+    collect_target_layers(layer)
+end
+
+local result = {
+    ok = true,
+    width = sprite.width,
+    height = sprite.height,
+    pivot_x = math.floor(sprite.width / 2) + offset_x,
+    pivot_y = math.floor(sprite.height / 2) - offset_y,
+    total_frames = #sprite.frames,
+    selected_frames = 0,
+    processed_frames = 0,
+    skipped_frames = {},
+    clipped_frames = {},
+    moved_cels = 0,
+    per_frame = {},
+    output_path = output_path
+}
+
+if not output_path or output_path == "" then
+    result.ok = false
+    result.error = "출력 파일 경로가 없습니다."
+elseif #target_leaf_layers == 0 then
+    result.ok = false
+    result.error = "대상 레이어 경로와 일치하는 drawable 레이어가 없습니다."
+end
+
+local frame_moves = {}
+if result.ok then
+    for _, frame in ipairs(sprite.frames) do
+        local frame_number = frame.frameNumber
+        if frame_is_target(frame_number) then
+            result.selected_frames = result.selected_frames + 1
+            local left = nil
+            local top = nil
+            local right = nil
+            local bottom = nil
+
+            for _, layer in ipairs(target_leaf_layers) do
+                local cel = layer:cel(frame_number)
+                if cel and cel.image and not cel.image:isEmpty() then
+                    local local_bounds = cel.image:shrinkBounds()
+                    if local_bounds and local_bounds.width > 0 and local_bounds.height > 0 then
+                        local cel_left = cel.position.x + local_bounds.x
+                        local cel_top = cel.position.y + local_bounds.y
+                        local cel_right = cel_left + local_bounds.width
+                        local cel_bottom = cel_top + local_bounds.height
+
+                        left = left and math.min(left, cel_left) or cel_left
+                        top = top and math.min(top, cel_top) or cel_top
+                        right = right and math.max(right, cel_right) or cel_right
+                        bottom = bottom and math.max(bottom, cel_bottom) or cel_bottom
+                    end
+                end
+            end
+
+            if left == nil then
+                table.insert(result.skipped_frames, {
+                    frame = frame_number,
+                    reason = "대상 레이어에 표시 가능한 픽셀이 없습니다."
+                })
+            else
+                local bbox_width = right - left
+                local bbox_height = bottom - top
+                local bbox_center_x = left + math.floor(bbox_width / 2)
+                local bbox_bottom_y = bottom
+                local dx = result.pivot_x - bbox_center_x
+                local dy = result.pivot_y - bbox_bottom_y
+                local moved_left = left + dx
+                local moved_top = top + dy
+                local moved_right = right + dx
+                local moved_bottom = bottom + dy
+                local clipped = (
+                    moved_left < 0 or
+                    moved_top < 0 or
+                    moved_right > sprite.width or
+                    moved_bottom > sprite.height
+                )
+                local frame_result = {
+                    frame = frame_number,
+                    bbox = {
+                        left = left,
+                        top = top,
+                        right = right,
+                        bottom = bottom,
+                        width = bbox_width,
+                        height = bbox_height
+                    },
+                    bbox_center_x = bbox_center_x,
+                    bbox_bottom_y = bbox_bottom_y,
+                    dx = dx,
+                    dy = dy,
+                    moved_bbox = {
+                        left = moved_left,
+                        top = moved_top,
+                        right = moved_right,
+                        bottom = moved_bottom,
+                        width = bbox_width,
+                        height = bbox_height
+                    },
+                    clipped = clipped,
+                    warnings = {}
+                }
+                if clipped then
+                    table.insert(frame_result.warnings, "이동 후 bbox가 캔버스 밖으로 나갑니다.")
+                    table.insert(result.clipped_frames, frame_number)
+                end
+                table.insert(result.per_frame, frame_result)
+                table.insert(frame_moves, {frame = frame_number, dx = dx, dy = dy})
+            end
+        end
+    end
+
+    if result.selected_frames == 0 then
+        result.ok = false
+        result.error = "적용 대상 프레임이 없습니다."
+    elseif #frame_moves == 0 then
+        result.ok = false
+        result.error = "적용 가능한 bbox가 없습니다."
+    elseif #result.clipped_frames > 0 then
+        result.ok = false
+        result.clipped_blocked = true
+        result.error = "클리핑이 예상되어 복사본 저장을 중단했습니다."
+    end
+end
+
+if result.ok then
+    local move_by_frame = {}
+    for _, item in ipairs(frame_moves) do
+        move_by_frame[item.frame] = item
+    end
+
+    app.transaction(function()
+        for _, layer in ipairs(target_leaf_layers) do
+            for _, frame in ipairs(sprite.frames) do
+                local frame_number = frame.frameNumber
+                local move = move_by_frame[frame_number]
+                if move then
+                    local cel = layer:cel(frame_number)
+                    if cel then
+                        cel.position = Point(cel.position.x + move.dx, cel.position.y + move.dy)
+                        result.moved_cels = result.moved_cels + 1
+                    end
+                end
+            end
+        end
+    end)
+
+    result.processed_frames = #frame_moves
+    sprite:saveCopyAs(output_path)
+end
+
+write_result(result)
+'''
+        return self.create_temp_lua_script(content)
+
+    def run_aseprite_pivot_apply_copy(self, path, target_layer_paths, target_frame_mode, checked_tags, offset_x=0, offset_y=0, suffix="_pivot"):
+        if not self.validate_aseprite_path(self.aseprite_path.get()):
+            return {"ok": False, "error": "유효한 Aseprite 실행 파일 경로가 아닙니다."}
+        if not path or not os.path.exists(path):
+            return {"ok": False, "error": "처리할 Aseprite 파일을 찾을 수 없습니다."}
+        if not target_layer_paths:
+            return {"ok": False, "error": "수정 대상으로 체크된 레이어가 없습니다."}
+        if target_frame_mode == "tags" and not checked_tags:
+            return {"ok": False, "error": "체크된 태그 프레임 범위가 없습니다."}
+
+        directory = os.path.dirname(path)
+        base_name, ext = os.path.splitext(os.path.basename(path))
+        suffix = suffix.strip() or "_pivot"
+        output_path = os.path.join(directory, f"{base_name}{suffix}{ext}")
+        counter = 1
+        while os.path.exists(output_path):
+            output_path = os.path.join(directory, f"{base_name}{suffix}_{counter:03d}{ext}")
+            counter += 1
+
+        if os.path.abspath(output_path) == os.path.abspath(path):
+            return {"ok": False, "error": "출력 경로가 원본과 같습니다. 작업을 중단합니다."}
+
+        script_path = None
+        result_path = None
+        layers_path = None
+        ranges_path = None
+        try:
+            script_path = self.create_aseprite_pivot_apply_lua()
+            fd, result_path = tempfile.mkstemp(suffix=".json")
+            os.close(fd)
+            fd, layers_path = tempfile.mkstemp(suffix=".txt", text=True)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as file:
+                for layer_path in target_layer_paths:
+                    file.write(f"{layer_path}\n")
+            fd, ranges_path = tempfile.mkstemp(suffix=".txt", text=True)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as file:
+                for start, finish in checked_tags:
+                    file.write(f"{int(start)},{int(finish)}\n")
+
+            args = [
+                path,
+                "--script-param", f"result_path={result_path}",
+                "--script-param", f"output_path={output_path}",
+                "--script-param", f"layers_path={layers_path}",
+                "--script-param", f"ranges_path={ranges_path}",
+                "--script-param", f"target_frame_mode={target_frame_mode}",
+                "--script-param", f"offset_x={int(offset_x)}",
+                "--script-param", f"offset_y={int(offset_y)}",
+                "--script", script_path
+            ]
+            ok, log = self.run_aseprite_cli(args)
+            if not ok:
+                return {"ok": False, "error": f"Aseprite 피봇 보정 Lua 실행 실패: {log}", "output_path": output_path}
+            if not os.path.exists(result_path) or os.path.getsize(result_path) == 0:
+                return {"ok": False, "error": "Aseprite 피봇 보정 결과 JSON이 생성되지 않았습니다.", "output_path": output_path}
+
+            try:
+                with open(result_path, "r", encoding="utf-8") as file:
+                    result = json.load(file)
+            except Exception as e:
+                return {"ok": False, "error": f"피봇 보정 결과 JSON 해석 실패: {e}", "output_path": output_path}
+
+            result["output_path"] = output_path
+            if result.get("ok"):
+                if not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
+                    result["ok"] = False
+                    result["error"] = "복사본 파일이 생성되지 않았거나 비어 있습니다."
+                elif self.inspect_aseprite_file(output_path) is None:
+                    result["ok"] = False
+                    result["error"] = "복사본 파일 검증에 실패했습니다."
+            return result
+        except Exception as e:
+            return {"ok": False, "error": f"피봇 보정 복사본 생성 중 오류가 발생했습니다: {e}", "output_path": output_path}
+        finally:
+            for temp_path in (script_path, result_path, layers_path, ranges_path):
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
+
+    def run_aseprite_layer_move(self, files, dx, dy, target_layers_list, target_frames_mode, tag_ranges, save_mode, suffix):
+        if not self.validate_aseprite_path(self.aseprite_path.get()):
+            messagebox.showwarning("경고", "Aseprite 경로를 먼저 설정해주세요.")
+            return
+
+        if not files:
+            messagebox.showwarning("경고", "처리할 Aseprite 파일(.ase, .aseprite)을 추가해주세요.")
+            return
+
+        if not target_layers_list:
+            messagebox.showwarning("경고", "선택된 대상 레이어가 없습니다.")
+            return
+
+        success = 0
+        
+        # Serialize python lists to Lua code
+        layers_str = "{" + ",".join(f'["{l}"]=true' for l in target_layers_list) + "}"
+        frames_str = "{"
+        for f_start, f_end in tag_ranges:
+            frames_str += f"{{start={f_start}, finish={f_end}}},"
+        frames_str += "}"
+
+        lua_content = f"""
+local app = app
+local sprite = app.activeSprite
+if not sprite then return end
+
+local dx = {dx}
+local dy = {dy}
+local target_frames_mode = "{target_frames_mode}"
+
+local layer_names = {layers_str}
+local tag_ranges = {frames_str}
+
+local function is_frame_in_range(frame_num)
+    if #tag_ranges == 0 then return false end
+    for _, r in ipairs(tag_ranges) do
+        if frame_num >= r.start and frame_num <= r.finish then
+            return true
+        end
+    end
+    return false
+end
+
+local function get_layer_path(layer)
+    local path = layer.name
+    local p = layer.parent
+    while p and p ~= sprite do
+        path = p.name .. "/" .. path
+        p = p.parent
+    end
+    return path
+end
+
+local target_layers_mode = "selected"
+
+local function process_layer(layer)
+    if layer.isGroup then
+        for _, sublayer in ipairs(layer.layers) do
+            process_layer(sublayer)
+        end
+    else
+        local path = get_layer_path(layer)
+        if target_layers_mode == "all" or layer_names[path] then
+            if target_frames_mode == "all" then
+                for _, frame in ipairs(sprite.frames) do
+                    local cel = layer:cel(frame.frameNumber)
+                    if cel then
+                        cel.position = Point(cel.position.x + dx, cel.position.y + dy)
+                    end
+                end
+            elseif target_frames_mode == "tags" then
+                for _, frame in ipairs(sprite.frames) do
+                    if is_frame_in_range(frame.frameNumber) then
+                        local cel = layer:cel(frame.frameNumber)
+                        if cel then
+                            cel.position = Point(cel.position.x + dx, cel.position.y + dy)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+for _, layer in ipairs(sprite.layers) do
+    process_layer(layer)
+end
+
+local out_path = app.params["output_path"]
+if out_path then
+    sprite:saveCopyAs(out_path)
+end
+"""
+        script_path = self.create_temp_lua_script(lua_content)
+
+        try:
+            for p in files:
+                name, ext = os.path.splitext(p)
+                
+                if save_mode == "copy":
+                    out_p = f"{name}{suffix}{ext}"
+                    counter = 1
+                    while os.path.exists(out_p) and out_p != p:
+                        out_p = f"{name}{suffix}_{counter:03d}{ext}"
+                        counter += 1
+                else: # overwrite
+                    try:
+                        backup_dir = os.path.join(os.path.dirname(p), "_aseprite_backup")
+                        os.makedirs(backup_dir, exist_ok=True)
+                        filename = os.path.basename(p)
+                        backup_path = self.get_unique_backup_path(backup_dir, filename)
+                        shutil.copy2(p, backup_path)
+                    except Exception as e:
+                        messagebox.showerror("백업 실패", f"파일: {os.path.basename(p)}\n백업 실패로 인해 덮어쓰기를 취소합니다.\n오류: {e}")
+                        continue
+                    
+                    # Aseprite CLI가 원본을 열고 바로 덮어쓰면 충돌이 날 수 있으므로 임시 파일에 저장 후 교체
+                    fd, temp_out = tempfile.mkstemp(suffix=ext)
+                    os.close(fd)
+                    out_p = temp_out
+
+                args = [p, "--script-param", f"output_path={out_p}", "--script", script_path]
+                ok, log = self.run_aseprite_cli(args)
+                
+                if ok:
+                    if save_mode == "overwrite":
+                        try:
+                            shutil.move(out_p, p)
+                            success += 1
+                        except Exception as e:
+                            messagebox.showerror("덮어쓰기 오류", f"원본 파일을 교체하는 중 오류가 발생했습니다.\n오류: {e}")
+                    else:
+                        success += 1
+                else:
+                    messagebox.showerror("Aseprite 실행 오류", f"파일: {os.path.basename(p)}\n오류: {log}")
+                    if save_mode == "overwrite" and os.path.exists(out_p):
+                        try: os.remove(out_p)
+                        except: pass
+                    
+        finally:
+            if os.path.exists(script_path):
+                os.remove(script_path)
+
+        messagebox.showinfo("처리 완료", f"총 {success}개의 Aseprite 레이어 이동 작업이 완료되었습니다.")
+
+    def run_aseprite_pivot_fix(self):
+        if not self.validate_aseprite_path(self.aseprite_path.get()):
+            messagebox.showwarning("경고", "Aseprite 경로를 먼저 설정해주세요.")
+            return
+        messagebox.showinfo("안내", "Aseprite 피봇 보정 기능은 현재 기초 구조 및 CLI 연결이 준비되었습니다.\n(곧 업데이트됩니다!)")
+
+    def show_aseprite_tools(self):
+        ase_win = tk.Toplevel(self.root)
+        ase_win.title("Aseprite 연동 도구")
+        ase_win.geometry("1200x820")
+        ase_win.minsize(1000, 720)
+        if self.is_always_on_top.get():
+            ase_win.attributes('-topmost', True)
+            
+        c = self.get_colors()
+        ase_win.configure(bg=c["BG_COLOR"])
+
+        self.auto_detect_aseprite_path()
+
+        # ================= 상단: 경로 상태 및 설정 =================
+        header_frame = ttk.Frame(ase_win, style="TFrame")
+        header_frame.pack(fill="x", padx=15, pady=10)
+        
+        status_text = "연결됨" if self.aseprite_path.get() else "경로 미설정"
+        lbl_status = ttk.Label(header_frame, text=f"Aseprite: {status_text}", font=("Malgun Gothic", 10, "bold"), foreground=c["PRIMARY_COLOR"] if self.aseprite_path.get() else c["DANGER_COLOR"])
+        lbl_status.pack(side="left")
+        
+        def open_path_settings():
+            pop = tk.Toplevel(ase_win)
+            pop.title("Aseprite 경로 설정")
+            pop.geometry("600x150")
+            if self.is_always_on_top.get(): pop.attributes('-topmost', True)
+            pop.configure(bg=c["BG_COLOR"])
+            
+            f = ttk.Frame(pop, style="TFrame")
+            f.pack(fill="both", expand=True, padx=20, pady=20)
+            ttk.Label(f, text="Aseprite 실행 파일 경로:").pack(anchor="w", pady=(0, 5))
+            
+            ent_frame = ttk.Frame(f, style="TFrame")
+            ent_frame.pack(fill="x")
+            
+            ttk.Entry(ent_frame, textvariable=self.aseprite_path, state="readonly").pack(side="left", fill="x", expand=True, padx=(0, 10))
+            def do_find():
+                self.find_aseprite_exe()
+                st = "연결됨" if self.aseprite_path.get() else "경로 미설정"
+                lbl_status.config(text=f"Aseprite: {st}", foreground=c["PRIMARY_COLOR"] if self.aseprite_path.get() else c["DANGER_COLOR"])
+            ttk.Button(ent_frame, text="경로 찾기", command=do_find).pack(side="left")
+            ttk.Button(ent_frame, text="닫기", command=pop.destroy).pack(side="left", padx=(10, 0))
+
+        ttk.Button(header_frame, text="⚙ 설정", command=open_path_settings).pack(side="left", padx=10)
+
+        # ================= 중앙/하단 분할 패널 =================
+        main_split = ttk.PanedWindow(ase_win, orient=tk.HORIZONTAL)
+        main_split.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+
+        # ==================== 좌측: 파일 리스트 ====================
+        left_frame = ttk.Frame(main_split, style="Panel.TFrame")
+        main_split.add(left_frame, weight=0) # weight 0 to restrict width
+
+        ttk.Label(left_frame, text="작업 대상 파일 (.ase, .aseprite)").pack(anchor="w", padx=10, pady=(10, 0))
+        ttk.Label(left_frame, text="* 파일 및 폴더 드래그 앤 드롭 지원", style="Muted.TLabel").pack(anchor="w", padx=10)
+        
+        list_frame = ttk.Frame(left_frame, style="Panel.TFrame")
+        list_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        list_scroll = ttk.Scrollbar(list_frame)
+        list_scroll.pack(side="right", fill="y")
+        
+        ase_listbox = ttk.Treeview(list_frame, columns=("check", "name"), show="headings", yscrollcommand=list_scroll.set, selectmode="extended")
+        ase_listbox.heading("check", text="")
+        ase_listbox.column("check", width=34, anchor="center", stretch=False)
+        ase_listbox.heading("name", text="Aseprite 파일", anchor="w")
+        ase_listbox.column("name", width=210, anchor="w", stretch=True)
+        ase_listbox.pack(side="left", fill="both", expand=True)
+        list_scroll.config(command=ase_listbox.yview)
+        
+        self.ase_metadata = {}
+        self.current_preview_temp = None
+        current_ase_path = {"path": None}
+        current_preview_frame = {"frame": 1}
+        preview_after_id = {"id": None}
+        preview_resize_after_id = {"id": None}
+        preview_move_after_id = {"id": None}
+        preview_zoom = {"mode": "fit", "scale": 1.0}
+        current_preview_source = {"path": None, "frame": None, "image": None}
+        ase_exec_option_guard = {"restoring": False}
+
+        def get_ase_file_checked(path):
+            return self.ase_selection_state.get(path, {}).get("file_checked", True)
+
+        def set_ase_file_checked(path, checked):
+            state = self.ase_selection_state.setdefault(path, {})
+            state["file_checked"] = checked
+
+        def refresh_ase_file_list(select_index=None):
+            current_selection = get_ase_selection_indices()
+            if select_index is None and current_selection:
+                select_index = current_selection[0]
+            for item in ase_listbox.get_children():
+                ase_listbox.delete(item)
+            for idx, path in enumerate(self.aseprite_files):
+                check = "☑" if get_ase_file_checked(path) else "☐"
+                ase_listbox.insert("", "end", iid=str(idx), values=(check, os.path.basename(path)))
+            if select_index is not None and 0 <= select_index < len(self.aseprite_files):
+                iid = str(select_index)
+                ase_listbox.selection_set(iid)
+                ase_listbox.focus(iid)
+                ase_listbox.see(iid)
+
+        def get_ase_selection_indices():
+            result = []
+            for item in ase_listbox.selection():
+                try:
+                    idx = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx < len(self.aseprite_files):
+                    result.append(idx)
+            return sorted(result)
+
+        def clear_ase_selection():
+            selection = ase_listbox.selection()
+            if selection:
+                ase_listbox.selection_remove(selection)
+
+        def set_active_ase_index(idx):
+            clear_ase_selection()
+            if 0 <= idx < len(self.aseprite_files):
+                iid = str(idx)
+                ase_listbox.selection_set(iid)
+                ase_listbox.focus(iid)
+                ase_listbox.see(iid)
+
+        def on_ase_file_click(event):
+            if ase_listbox.identify_region(event.x, event.y) != "cell":
+                return
+            if ase_listbox.identify_column(event.x) != "#1":
+                return
+            item = ase_listbox.identify_row(event.y)
+            if not item:
+                return
+            try:
+                idx = int(item)
+            except ValueError:
+                return
+            if not (0 <= idx < len(self.aseprite_files)):
+                return
+            path = self.aseprite_files[idx]
+            set_ase_file_checked(path, not get_ase_file_checked(path))
+            values = list(ase_listbox.item(item, "values"))
+            values[0] = "☑" if get_ase_file_checked(path) else "☐"
+            ase_listbox.item(item, values=tuple(values))
+            return "break"
+
+        def set_all_ase_file_checks(checked):
+            for path in self.aseprite_files:
+                set_ase_file_checked(path, checked)
+            refresh_ase_file_list()
+
+        ase_listbox.curselection = get_ase_selection_indices
+        refresh_ase_file_list()
+
+        target_frame_mode = tk.StringVar(value="tags")
+
+        def save_current_ase_ui_state(path):
+            if not path: return
+            state = self.ase_selection_state.setdefault(path, {})
+            state.update({
+                "preview_visible_layers": set(),
+                "edit_target_layers": set(),
+                "checked_tags": set(),
+                "target_frame_mode": target_frame_mode.get()
+            })
+            if not ase_exec_option_guard["restoring"]:
+                try:
+                    state["exec_options"] = get_current_exec_options().copy()
+                except NameError:
+                    pass
+            for item in layer_tree.get_children():
+                val = layer_tree.item(item, "values")
+                if val[0] == "☑":
+                    state["preview_visible_layers"].add(val[2])
+                if val[1] == "☑":
+                    state["edit_target_layers"].add(val[2])
+            for item in tag_tree.get_children():
+                val = tag_tree.item(item, "values")
+                if val[0] == "☑" and val[1] != "태그 없음": state["checked_tags"].add(val[1])
+
+        def restore_ase_ui_state(path):
+            ase_exec_option_guard["restoring"] = True
+            if path in self.ase_selection_state:
+                state = self.ase_selection_state[path]
+                edit_target_layers_saved = state.get("edit_target_layers", state.get("checked_layers"))
+                if edit_target_layers_saved is None:
+                    edit_target_layers = {
+                        layer_tree.item(item, "values")[2]
+                        for item in layer_tree.get_children()
+                    }
+                else:
+                    edit_target_layers = set(edit_target_layers_saved)
+                preview_visible_layers = state.get("preview_visible_layers")
+                if preview_visible_layers is None:
+                    preview_visible_layers = {
+                        layer_tree.item(item, "values")[2]
+                        for item in layer_tree.get_children()
+                        if layer_tree.item(item, "values")[3] == "보기"
+                    }
+                else:
+                    preview_visible_layers = set(preview_visible_layers)
+
+                state["edit_target_layers"] = edit_target_layers
+                state["preview_visible_layers"] = preview_visible_layers
+                for item in layer_tree.get_children():
+                    val = layer_tree.item(item, "values")
+                    preview_check = "☑" if val[2] in preview_visible_layers else "☐"
+                    edit_check = "☑" if val[2] in edit_target_layers else "☐"
+                    layer_tree.item(item, values=(preview_check, edit_check, val[2], val[3]))
+                for item in tag_tree.get_children():
+                    val = tag_tree.item(item, "values")
+                    if val[1] != "태그 없음":
+                        check = "☑" if val[1] in state.get("checked_tags", set()) else "☐"
+                        tag_tree.item(item, values=(check, val[1], val[2]))
+                target_frame_mode.set(state.get("target_frame_mode", "tags"))
+                exec_options = state.get("exec_options")
+                if exec_options:
+                    dx_var.set(str(exec_options.get("dx", 0)))
+                    dy_var.set(str(exec_options.get("dy", 0)))
+                    save_mode_var.set(exec_options.get("save_mode", "copy"))
+                    suffix_var.set(exec_options.get("move_suffix", "_move"))
+                    pivot_suffix_var.set(exec_options.get("pivot_suffix", "_pivot"))
+                else:
+                    dx_var.set("0")
+                    dy_var.set("0")
+                    save_mode_var.set("copy")
+                    suffix_var.set("_move")
+                    pivot_suffix_var.set("_pivot")
+            else:
+                target_frame_mode.set("tags")
+                dx_var.set("0")
+                dy_var.set("0")
+                save_mode_var.set("copy")
+                suffix_var.set("_move")
+                pivot_suffix_var.set("_pivot")
+            ase_exec_option_guard["restoring"] = False
+
+        def get_preview_visible_layers():
+            return [
+                layer_tree.item(item, "values")[2]
+                for item in layer_tree.get_children()
+                if layer_tree.item(item, "values")[0] == "☑"
+            ]
+
+        def invalidate_ase_preview_source():
+            old_source = current_preview_source["image"]
+            if old_source is not None:
+                try:
+                    old_source.close()
+                except:
+                    pass
+            current_preview_source["path"] = None
+            current_preview_source["frame"] = None
+            current_preview_source["image"] = None
+
+        def refresh_ase_preview(delay=50):
+            sel = ase_listbox.curselection()
+            if not sel:
+                return
+
+            idx = sel[0]
+            if idx < 0 or idx >= len(self.aseprite_files):
+                return
+
+            path = self.aseprite_files[idx]
+            frame = current_preview_frame["frame"]
+            visible_layer_paths = tuple(get_preview_visible_layers())
+
+            if preview_after_id["id"] is not None:
+                try:
+                    ase_win.after_cancel(preview_after_id["id"])
+                except tk.TclError:
+                    pass
+                preview_after_id["id"] = None
+
+            def run_refresh(p=path, f=frame, layers=visible_layer_paths):
+                preview_after_id["id"] = None
+                update_preview_image(p, f, layers)
+
+            preview_after_id["id"] = ase_win.after(delay, run_refresh)
+
+        def set_preview_zoom(mode, scale=None):
+            preview_zoom["mode"] = mode
+            if scale is not None:
+                preview_zoom["scale"] = max(0.25, min(8.0, float(scale)))
+            if current_preview_source["image"] is not None:
+                render_ase_preview_canvas()
+            else:
+                refresh_ase_preview()
+
+        def step_preview_zoom(direction):
+            current_scale = preview_zoom["scale"]
+            factor = 2.0 if direction > 0 else 0.5
+            set_preview_zoom("manual", current_scale * factor)
+
+        def on_preview_mousewheel(event):
+            if not (event.state & 0x0004):
+                return
+            step_preview_zoom(1 if event.delta > 0 else -1)
+            return "break"
+
+        def on_preview_canvas_resize(event=None):
+            if preview_zoom["mode"] != "fit":
+                return
+            if preview_resize_after_id["id"] is not None:
+                try:
+                    ase_win.after_cancel(preview_resize_after_id["id"])
+                except tk.TclError:
+                    pass
+
+            def refresh_after_resize():
+                preview_resize_after_id["id"] = None
+                if current_preview_source["image"] is not None:
+                    render_ase_preview_canvas()
+
+            preview_resize_after_id["id"] = ase_win.after(200, refresh_after_resize)
+
+        def get_layers_in_visual_order(layers):
+            nodes = {"": {"data": None, "children": []}}
+
+            def ensure_node(path):
+                if path not in nodes:
+                    nodes[path] = {"data": None, "children": []}
+                    parent_path = path.rsplit("/", 1)[0] if "/" in path else ""
+                    ensure_node(parent_path)
+                    if path not in nodes[parent_path]["children"]:
+                        nodes[parent_path]["children"].append(path)
+                return nodes[path]
+
+            for layer in layers:
+                path = layer["path"]
+                node = ensure_node(path)
+                node["data"] = layer
+
+            result = []
+
+            def walk(parent_path):
+                for child_path in reversed(nodes[parent_path]["children"]):
+                    child = nodes[child_path]
+                    if child["data"] is not None:
+                        result.append(child["data"])
+                    walk(child_path)
+
+            walk("")
+            return result
+
+        def update_inspector(event=None):
+            sel = get_ase_selection_indices()
+            if not sel: return
+            idx = sel[0]
+            path = self.aseprite_files[idx]
+            
+            if current_ase_path["path"] and current_ase_path["path"] != path:
+                save_current_ase_ui_state(current_ase_path["path"])
+                
+            current_ase_path["path"] = path
+            
+            meta = self.inspect_aseprite_file(path)
+            if meta:
+                self.ase_metadata[path] = meta
+                
+                info_text = f"[{os.path.basename(path)}]\n원본 캔버스: {meta['width']}x{meta['height']}px | {meta['frames']}프레임 | 태그 {len(meta['tags'])}개"
+                info_lbl.config(text=info_text)
+                
+                for item in layer_tree.get_children(): layer_tree.delete(item)
+                for l in get_layers_in_visual_order(meta['layers']):
+                    vis = "보기" if l['isVisible'] else "숨김"
+                    preview_check = "☑" if l['isVisible'] else "☐"
+                    layer_tree.insert("", tk.END, values=(preview_check, "☑", l['path'], vis))
+                    
+                for item in tag_tree.get_children(): tag_tree.delete(item)
+                if not meta['tags']:
+                    tag_tree.insert("", tk.END, values=("", "태그 없음", ""))
+                else:
+                    for t in meta['tags']:
+                        tag_tree.insert("", tk.END, values=("☐", t['name'], f"{t['fromFrame']} ~ {t['toFrame']}"))
+                
+                restore_ase_ui_state(path)
+                
+                preview_frame = 1
+                for item in tag_tree.get_children():
+                    val = tag_tree.item(item, "values")
+                    if val[0] == "☑" and val[1] != "태그 없음":
+                        try:
+                            rng = val[2].split("~")
+                            preview_frame = int(rng[0].strip())
+                            break
+                        except: pass
+                 
+                current_preview_frame["frame"] = preview_frame
+                refresh_ase_preview(delay=100)
+            else:
+                print(f"인스펙터 메타데이터 로드 실패: {path}")
+
+        def render_ase_preview_canvas():
+            source_img = current_preview_source["image"]
+            path = current_preview_source["path"]
+            frame = current_preview_source["frame"]
+            if source_img is None or not path or frame is None:
+                return
+
+            try:
+                import PIL.Image
+                import PIL.ImageTk
+
+                try:
+                    dx = int(dx_var.get() or 0)
+                except (ValueError, TypeError):
+                    dx = 0
+                try:
+                    dy = int(dy_var.get() or 0)
+                except (ValueError, TypeError):
+                    dy = 0
+
+                # Preview-only fallback: move the composited frame without saving the Aseprite file.
+                moved_img = PIL.Image.new("RGBA", source_img.size, (0, 0, 0, 0))
+                moved_img.paste(source_img, (dx, dy), source_img)
+
+                c_w = preview_canvas.winfo_width()
+                c_h = preview_canvas.winfo_height()
+                if c_w < 10: c_w = 420
+                if c_h < 10: c_h = 420
+
+                if preview_zoom["mode"] == "fit":
+                    ratio = min((c_w-20)/moved_img.width, (c_h-20)/moved_img.height)
+                    if ratio >= 1:
+                        ratio = max(1, int(ratio))
+                    ratio = max(0.25, min(8.0, ratio))
+                    preview_zoom["scale"] = ratio
+                    zoom_text = f"맞춤 ({ratio:g}x)"
+                else:
+                    ratio = max(0.25, min(8.0, preview_zoom["scale"]))
+                    preview_zoom["scale"] = ratio
+                    zoom_text = f"{ratio:g}x"
+
+                new_w = max(1, int(moved_img.width * ratio))
+                new_h = max(1, int(moved_img.height * ratio))
+                img_resized = moved_img.resize((new_w, new_h), PIL.Image.Resampling.NEAREST)
+                self.ase_tk_preview = PIL.ImageTk.PhotoImage(img_resized)
+
+                preview_canvas.delete("all")
+                size = 10
+                color1 = "#ffffff" if not self.is_dark_mode.get() else "#2A2A2A"
+                color2 = "#f1f5f9" if not self.is_dark_mode.get() else "#202020"
+                for y in range(0, c_h, size):
+                    for x in range(0, c_w, size):
+                        color = color1 if ((x//size) + (y//size)) % 2 == 0 else color2
+                        preview_canvas.create_rectangle(x, y, x+size, y+size, fill=color, outline="")
+
+                cx, cy = c_w // 2, c_h // 2
+                preview_canvas.create_image(cx, cy, image=self.ase_tk_preview, anchor="center")
+
+                cross_color = "#06b6d4" if not self.is_dark_mode.get() else "#22D3EE"
+                preview_canvas.create_line(0, cy, c_w, cy, fill=cross_color, width=1, tags="crosshair")
+                preview_canvas.create_line(cx, 0, cx, c_h, fill=cross_color, width=1, tags="crosshair")
+
+                orig_x1 = cx - (new_w // 2)
+                orig_y1 = cy - (new_h // 2)
+                orig_x2 = orig_x1 + new_w
+                orig_y2 = orig_y1 + new_h
+                outline_color = "#ef4444" if not self.is_dark_mode.get() else "#F87171"
+                preview_canvas.create_rectangle(orig_x1, orig_y1, orig_x2, orig_y2, outline=outline_color, dash=(2, 2))
+
+                tag_name = ""
+                for item in tag_tree.get_children():
+                    val = tag_tree.item(item, "values")
+                    if val[0] == "☑" and val[1] != "태그 없음":
+                        try:
+                            rng = val[2].split("~")
+                            if int(rng[0].strip()) == frame:
+                                tag_name = f" [{val[1]}]"
+                                break
+                        except: pass
+
+                info_lbl.config(
+                    text=(
+                        f"파일명: {os.path.basename(path)}\n"
+                        f"표시 프레임: {frame}{tag_name}\n"
+                        f"원본 캔버스: {source_img.width}x{source_img.height} px\n"
+                        f"표시 크기: {new_w}x{new_h} px\n"
+                        f"미리보기 전용 전체 이미지 가상 이동: X {dx}, Y {dy}"
+                    )
+                )
+                zoom_lbl.config(text=f"배율: {zoom_text}")
+            except Exception as e:
+                print(f"미리보기 렌더링 실패: {e}")
+                info_lbl.config(text=f"미리보기 렌더링 실패\n프레임: {frame}\n에러: {e}")
+
+        def update_preview_image(path, frame=1, visible_layer_paths=None):
+            if self.current_preview_temp and os.path.exists(self.current_preview_temp):
+                try: os.remove(self.current_preview_temp)
+                except: pass
+
+            if visible_layer_paths is None:
+                visible_layer_paths = get_preview_visible_layers()
+            else:
+                visible_layer_paths = list(visible_layer_paths)
+
+            if not visible_layer_paths:
+                invalidate_ase_preview_source()
+                preview_canvas.delete("all")
+                c_w = max(1, preview_canvas.winfo_width())
+                c_h = max(1, preview_canvas.winfo_height())
+                self.draw_checkerboard(preview_canvas, c_w, c_h)
+                info_lbl.config(
+                    text=(
+                        f"파일명: {os.path.basename(path)}\n"
+                        f"표시 프레임: {frame}\n"
+                        "보기 레이어 없음\n"
+                        "레이어 트리에서 보기 항목을 체크하세요."
+                    )
+                )
+                zoom_lbl.config(text="배율: -")
+                return
+
+            tmp_png = self.export_aseprite_preview_png_with_visible_layers(
+                path,
+                frame,
+                visible_layer_paths
+            )
+            if tmp_png:
+                self.current_preview_temp = tmp_png
+                try:
+                    import PIL.Image
+                    with PIL.Image.open(tmp_png) as img:
+                        source_img = img.convert("RGBA")
+                        source_img.load()
+
+                    old_source = current_preview_source["image"]
+                    if old_source is not None:
+                        try: old_source.close()
+                        except: pass
+
+                    current_preview_source["path"] = path
+                    current_preview_source["frame"] = frame
+                    current_preview_source["image"] = source_img
+                    render_ase_preview_canvas()
+                except Exception as e:
+                    print(f"미리보기 로드 실패 (Image.open): {e}")
+                    info_lbl.config(text=f"미리보기 이미지 열기 실패\n프레임: {frame}\n에러: {e}")
+            else:
+                print(f"미리보기 PNG 생성 실패 연동 로직 (path: {path}, frame: {frame})")
+                info_lbl.config(text=f"미리보기 PNG 생성 실패\n프레임: {frame}\n콘솔 로그를 확인하세요.")
+
+        ase_listbox.bind('<Button-1>', on_ase_file_click)
+        ase_listbox.bind('<<TreeviewSelect>>', lambda e: [update_inspector(), update_expected_label()], add="+")
+
+        def add_file_or_folder(p_norm):
+            import glob
+            if os.path.isdir(p_norm):
+                added = False
+                for f in glob.glob(os.path.join(p_norm, "*.*")):
+                    if f.lower().endswith((".ase", ".aseprite")) and f not in self.aseprite_files:
+                        self.aseprite_files.append(f)
+                        set_ase_file_checked(f, True)
+                        added = True
+                return added
+            elif p_norm.lower().endswith((".ase", ".aseprite")) and p_norm not in self.aseprite_files:
+                self.aseprite_files.append(p_norm)
+                set_ase_file_checked(p_norm, True)
+                return True
+            return False
+
+        def on_ase_drop(event):
+            paths = ase_win.tk.splitlist(event.data)
+            if not paths: return
+            
+            added = False
+            for p in paths:
+                if add_file_or_folder(os.path.normpath(p)):
+                    added = True
+                    
+            if added and len(self.aseprite_files) > 0:
+                refresh_ase_file_list(0)
+                update_inspector()
+                update_expected_label()
+
+        # DND
+        from tkinterdnd2 import DND_FILES
+        ase_win.drop_target_register(DND_FILES)
+        ase_win.dnd_bind('<<Drop>>', on_ase_drop)
+        ase_listbox.drop_target_register(DND_FILES)
+        ase_listbox.dnd_bind('<<Drop>>', on_ase_drop)
+
+        btn_frame = ttk.Frame(left_frame, style="Panel.TFrame")
+        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        btn_frame.columnconfigure((0,1), weight=1)
+        btn_frame2 = ttk.Frame(left_frame, style="Panel.TFrame")
+        btn_frame2.pack(fill="x", padx=10, pady=(0, 10))
+        btn_frame2.columnconfigure((0,1), weight=1)
+        btn_frame3 = ttk.Frame(left_frame, style="Panel.TFrame")
+        btn_frame3.pack(fill="x", padx=10, pady=(0, 10))
+        btn_frame3.columnconfigure((0,1), weight=1)
+        
+        def add_ase_files():
+            paths = filedialog.askopenfilenames(filetypes=[("Aseprite", "*.ase *.aseprite")])
+            added = False
+            for p in paths:
+                if add_file_or_folder(os.path.normpath(p)): added = True
+            if added:
+                refresh_ase_file_list(len(self.aseprite_files) - 1)
+                update_inspector()
+                update_expected_label()
+                
+        def add_ase_folder():
+            folder = filedialog.askdirectory()
+            if folder:
+                if add_file_or_folder(os.path.normpath(folder)):
+                    refresh_ase_file_list(len(self.aseprite_files) - 1)
+                    update_inspector()
+                    update_expected_label()
+                    
+        def remove_ase_files():
+            sel = get_ase_selection_indices()
+            if not sel: return
+            for idx in reversed(sel):
+                p = self.aseprite_files[idx]
+                if p in self.ase_metadata: del self.ase_metadata[p]
+                if p in self.ase_selection_state: del self.ase_selection_state[p]
+                if current_ase_path["path"] == p: current_ase_path["path"] = None
+                del self.aseprite_files[idx]
+            if len(self.aseprite_files) > 0:
+                refresh_ase_file_list(0)
+                update_inspector()
+                update_expected_label()
+            else:
+                info_lbl.config(text="파일을 선택하세요")
+                layer_tree.delete(*layer_tree.get_children())
+                tag_tree.delete(*tag_tree.get_children())
+                preview_canvas.delete("all")
+                update_expected_label()
+                
+        def clear_ase_files():
+            self.aseprite_files.clear()
+            self.ase_metadata.clear()
+            self.ase_selection_state.clear()
+            current_ase_path["path"] = None
+            refresh_ase_file_list()
+            info_lbl.config(text="파일을 선택하세요")
+            layer_tree.delete(*layer_tree.get_children())
+            tag_tree.delete(*tag_tree.get_children())
+            preview_canvas.delete("all")
+            update_expected_label()
+
+        ttk.Button(btn_frame, text="파일 추가", command=add_ase_files).grid(row=0, column=0, sticky="ew", padx=(0, 2))
+        ttk.Button(btn_frame, text="폴더 추가", command=add_ase_folder).grid(row=0, column=1, sticky="ew", padx=(2, 0))
+        ttk.Button(btn_frame2, text="선택 제거", command=remove_ase_files).grid(row=0, column=0, sticky="ew", padx=(0, 2))
+        ttk.Button(btn_frame2, text="전체 비우기", command=clear_ase_files).grid(row=0, column=1, sticky="ew", padx=(2, 0))
+        ttk.Button(btn_frame3, text="전체 체크", command=lambda: set_all_ase_file_checks(True)).grid(row=0, column=0, sticky="ew", padx=(0, 2))
+        ttk.Button(btn_frame3, text="전체 해제", command=lambda: set_all_ase_file_checks(False)).grid(row=0, column=1, sticky="ew", padx=(2, 0))
+
+        # ==================== 우측: 옵션 및 미리보기 ====================
+        right_frame = ttk.Frame(main_split, style="TFrame")
+        main_split.add(right_frame, weight=3)
+        
+        # Set sash position initially
+        ase_win.after(100, lambda: main_split.sashpos(0, 280))
+
+        # 우측 상단: 실행 옵션 (고정 영역)
+        exec_frame = ttk.LabelFrame(right_frame, text=" 실행 옵션 ")
+        exec_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        exec_frame.columnconfigure(1, weight=1)
+        
+        ttk.Label(exec_frame, text="가로 이동 / 피봇 X 오프셋(px):").grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        dx_var = tk.StringVar(value="0")
+        ttk.Spinbox(exec_frame, from_=-9999, to=9999, textvariable=dx_var, width=8).grid(row=0, column=1, sticky="w", pady=5)
+
+        ttk.Label(exec_frame, text="세로 이동 / 피봇 Y 오프셋(px):").grid(row=1, column=0, sticky="w", padx=10, pady=5)
+        dy_var = tk.StringVar(value="0")
+        ttk.Spinbox(exec_frame, from_=-9999, to=9999, textvariable=dy_var, width=8).grid(row=1, column=1, sticky="w", pady=5)
+
+        ttk.Label(exec_frame, text="저장 방식:").grid(row=0, column=2, sticky="w", padx=10, pady=5)
+        save_mode_var = tk.StringVar(value="copy")
+        save_mode_frame = ttk.Frame(exec_frame, style="Panel.TFrame")
+        save_mode_frame.grid(row=0, column=3, sticky="w", pady=5)
+        ttk.Radiobutton(save_mode_frame, text="새 파일로 저장", variable=save_mode_var, value="copy").pack(side="left", padx=(0, 10))
+        ttk.Radiobutton(save_mode_frame, text="원본 덮어쓰기", variable=save_mode_var, value="overwrite").pack(side="left")
+
+        ttk.Label(exec_frame, text="이동 복사본 접미사:").grid(row=1, column=2, sticky="w", padx=10, pady=5)
+        suffix_var = tk.StringVar(value="_move")
+        ttk.Entry(exec_frame, textvariable=suffix_var, width=20).grid(row=1, column=3, sticky="w", pady=5)
+
+        ttk.Label(exec_frame, text="피봇 복사본 접미사:").grid(row=2, column=2, sticky="w", padx=10, pady=5)
+        pivot_suffix_var = tk.StringVar(value="_pivot")
+        ttk.Entry(exec_frame, textvariable=pivot_suffix_var, width=20).grid(row=2, column=3, sticky="w", pady=5)
+
+        lbl_expected = ttk.Label(exec_frame, text="예상 저장 결과: ", style="Muted.TLabel")
+        lbl_expected.grid(row=3, column=0, columnspan=4, sticky="w", padx=10, pady=(5, 10))
+
+        def update_expected_label(*args):
+            sel = get_ase_selection_indices()
+            if not sel and not self.aseprite_files:
+                lbl_expected.config(text="예상 저장 결과: 대상 파일 없음")
+                return
+            if not sel:
+                lbl_expected.config(text="예상 저장 결과: 활성 파일을 선택하세요")
+                return
+                
+            path = self.aseprite_files[sel[0]]
+            name, ext = os.path.splitext(os.path.basename(path))
+            
+            mode = save_mode_var.get()
+            checked_files = [p for p in self.aseprite_files if get_ase_file_checked(p)]
+            total = len(checked_files)
+            
+            if mode == "overwrite":
+                if total:
+                    lbl_expected.config(text=f"예상 저장 결과: 체크된 {total}개 파일 원본 덮어쓰기 (백업: _aseprite_backup 폴더 생성 예정)")
+                else:
+                    lbl_expected.config(text="예상 저장 결과: 체크된 Aseprite 파일 없음")
+            else:
+                try: dx = int(dx_var.get())
+                except: dx = 0
+                try: dy = int(dy_var.get())
+                except: dy = 0
+                
+                suf = suffix_var.get().replace("{dx}", str(dx)).replace("{dy}", str(dy))
+                pivot_suf = pivot_suffix_var.get().replace("{dx}", str(dx)).replace("{dy}", str(dy))
+                if total:
+                    lbl_expected.config(text=f"예상 파일명: 체크된 {total}개 파일에 이동 {suf} 복사본 생성 (예: {name}{suf}{ext}) / 피봇 예: {name}{pivot_suf}{ext}")
+                else:
+                    lbl_expected.config(text="예상 파일명: 체크된 Aseprite 파일 없음")
+
+        def get_current_exec_options():
+            try: dx = int(dx_var.get() or 0)
+            except: dx = 0
+            try: dy = int(dy_var.get() or 0)
+            except: dy = 0
+            return {
+                "dx": dx,
+                "dy": dy,
+                "save_mode": save_mode_var.get(),
+                "move_suffix": suffix_var.get(),
+                "pivot_suffix": pivot_suffix_var.get()
+            }
+
+        def save_exec_options_for_selected():
+            if ase_exec_option_guard["restoring"]:
+                return
+            options = get_current_exec_options()
+            for idx in get_ase_selection_indices():
+                if 0 <= idx < len(self.aseprite_files):
+                    state = self.ase_selection_state.setdefault(self.aseprite_files[idx], {})
+                    state["exec_options"] = options.copy()
+
+        def on_move_preview_option_change(*args):
+            save_exec_options_for_selected()
+            update_expected_label()
+            if preview_move_after_id["id"] is not None:
+                try:
+                    ase_win.after_cancel(preview_move_after_id["id"])
+                except tk.TclError:
+                    pass
+
+            def render_after_move_change():
+                preview_move_after_id["id"] = None
+                if current_preview_source["image"] is not None:
+                    render_ase_preview_canvas()
+
+            preview_move_after_id["id"] = ase_win.after(80, render_after_move_change)
+
+        dx_var.trace_add("write", on_move_preview_option_change)
+        dy_var.trace_add("write", on_move_preview_option_change)
+        save_mode_var.trace_add("write", on_move_preview_option_change)
+        suffix_var.trace_add("write", on_move_preview_option_change)
+        pivot_suffix_var.trace_add("write", on_move_preview_option_change)
+
+        def on_execute_move():
+            try: dx = int(dx_var.get())
+            except: dx = 0
+            try: dy = int(dy_var.get())
+            except: dy = 0
+            
+            files_to_process = [path for path in self.aseprite_files if get_ase_file_checked(path)]
+            
+            if not files_to_process:
+                messagebox.showwarning("경고", "체크된 Aseprite 파일이 없습니다. 실행할 파일을 ☑ 체크해주세요.")
+                return
+
+            if save_mode_var.get() == "overwrite":
+                ans = messagebox.askyesno("경고", "원본 파일에 덮어씁니다.\n(진행 전 _aseprite_backup 폴더에 자동 백업됩니다.)\n정말 진행하시겠습니까?")
+                if not ans: return
+            
+            if current_ase_path["path"]:
+                save_current_ase_ui_state(current_ase_path["path"])
+
+            checked_layers = [
+                layer_tree.item(i, "values")[2]
+                for i in layer_tree.get_children()
+                if layer_tree.item(i, "values")[1] == "☑"
+            ]
+            if not checked_layers:
+                messagebox.showwarning("안내", "선택된 대상 레이어가 없습니다.")
+                return
+
+            checked_tags = []
+            if target_frame_mode.get() == "tags":
+                for i in tag_tree.get_children():
+                    val = tag_tree.item(i, "values")
+                    if val[0] == "☑" and val[1] != "태그 없음":
+                        rng = val[2].split("~")
+                        checked_tags.append((int(rng[0].strip()), int(rng[1].strip())))
+                
+                if not checked_tags:
+                    messagebox.showwarning("안내", "'체크된 태그만' 모드이지만 선택된 태그가 없습니다.")
+                    return
+            
+            raw_suffix = suffix_var.get().strip() or "_move"
+            suf = raw_suffix.replace("{dx}", str(dx)).replace("{dy}", str(dy))
+            
+            self.run_aseprite_layer_move(
+                files_to_process, 
+                dx, 
+                dy, 
+                checked_layers, 
+                target_frame_mode.get(), 
+                checked_tags, 
+                save_mode_var.get(), 
+                suf
+            )
+
+        def show_pivot_analysis_result(path, result, offset_x, offset_y):
+            result_win = tk.Toplevel(ase_win)
+            result_win.title("Aseprite 피봇 분석 결과")
+            result_win.geometry("760x620")
+            result_win.minsize(640, 480)
+            if self.is_always_on_top.get():
+                result_win.attributes("-topmost", True)
+
+            result_frame = ttk.Frame(result_win, padding=12)
+            result_frame.pack(fill="both", expand=True)
+
+            clipped_count = sum(1 for item in result.get("per_frame", []) if item.get("clipped"))
+            summary = (
+                f"파일: {os.path.basename(path)}\n"
+                f"캔버스: {result.get('width', 0)}x{result.get('height', 0)} px | "
+                f"목표 피봇: ({result.get('pivot_x', 0)}, {result.get('pivot_y', 0)})\n"
+                f"피봇 오프셋: X {offset_x}, Y {offset_y}\n"
+                f"대상 프레임: {result.get('selected_frames', 0)} | "
+                f"분석 완료: {result.get('analyzed_frames', 0)} | "
+                f"건너뜀: {len(result.get('skipped_frames', []))} | "
+                f"클리핑 예상: {clipped_count}\n"
+                "분석 전용 결과이며 실제 .ase/.aseprite 파일은 수정하지 않았습니다."
+            )
+            ttk.Label(result_frame, text=summary, justify="left").pack(fill="x", pady=(0, 10))
+
+            text_frame = ttk.Frame(result_frame)
+            text_frame.pack(fill="both", expand=True)
+            scrollbar = ttk.Scrollbar(text_frame)
+            scrollbar.pack(side="right", fill="y")
+            result_text = tk.Text(
+                text_frame,
+                wrap="none",
+                font=("Consolas", 10),
+                yscrollcommand=scrollbar.set
+            )
+            result_text.pack(side="left", fill="both", expand=True)
+            scrollbar.config(command=result_text.yview)
+
+            result_text.insert("end", "[프레임별 분석]\n")
+            for item in result.get("per_frame", []):
+                bbox = item.get("bbox", {})
+                moved = item.get("moved_bbox", {})
+                result_text.insert(
+                    "end",
+                    (
+                        f"Frame {item.get('frame')}: "
+                        f"bbox=({bbox.get('left')}, {bbox.get('top')}, "
+                        f"{bbox.get('right')}, {bbox.get('bottom')}) "
+                        f"size={bbox.get('width')}x{bbox.get('height')} | "
+                        f"centerX={item.get('bbox_center_x')} bottomY={item.get('bbox_bottom_y')} | "
+                        f"move=({item.get('dx')}, {item.get('dy')}) | "
+                        f"moved=({moved.get('left')}, {moved.get('top')}, "
+                        f"{moved.get('right')}, {moved.get('bottom')}) | "
+                        f"clipped={item.get('clipped')}\n"
+                    )
+                )
+                for warning in item.get("warnings", []):
+                    result_text.insert("end", f"  warning: {warning}\n")
+
+            skipped_frames = result.get("skipped_frames", [])
+            if skipped_frames:
+                result_text.insert("end", "\n[건너뜬 프레임]\n")
+                for skipped in skipped_frames:
+                    result_text.insert(
+                        "end",
+                        f"Frame {skipped.get('frame')}: {skipped.get('reason', '이유 없음')}\n"
+                    )
+
+            result_text.config(state="disabled")
+            ttk.Button(result_frame, text="닫기", command=result_win.destroy).pack(anchor="e", pady=(10, 0))
+
+        def on_analyze_pivot():
+            sel = get_ase_selection_indices()
+            if not sel:
+                messagebox.showwarning("피봇 분석", "분석할 Aseprite 파일을 하나 선택해주세요.")
+                return
+            path = self.aseprite_files[sel[0]]
+
+            target_layers = [
+                layer_tree.item(item, "values")[2]
+                for item in layer_tree.get_children()
+                if layer_tree.item(item, "values")[1] == "☑"
+            ]
+            if not target_layers:
+                messagebox.showwarning("피봇 분석", "수정 대상으로 체크된 레이어가 없습니다.")
+                return
+
+            checked_tags = []
+            if target_frame_mode.get() == "tags":
+                for item in tag_tree.get_children():
+                    values = tag_tree.item(item, "values")
+                    if values[0] == "☑" and values[1] != "태그 없음":
+                        try:
+                            start_text, finish_text = values[2].split("~")
+                            checked_tags.append((int(start_text.strip()), int(finish_text.strip())))
+                        except Exception:
+                            messagebox.showerror("피봇 분석", f"태그 프레임 범위를 읽을 수 없습니다: {values[1]}")
+                            return
+                if not checked_tags:
+                    messagebox.showwarning("피봇 분석", "체크된 태그 프레임 범위가 없습니다.")
+                    return
+
+            try:
+                offset_x = int(dx_var.get() or 0)
+            except (ValueError, TypeError):
+                offset_x = 0
+            try:
+                offset_y = int(dy_var.get() or 0)
+            except (ValueError, TypeError):
+                offset_y = 0
+
+            result = self.analyze_aseprite_pivot(
+                path,
+                target_layers,
+                target_frame_mode.get(),
+                checked_tags,
+                offset_x,
+                offset_y
+            )
+            if not result.get("ok"):
+                messagebox.showerror("피봇 분석 실패", result.get("error", "알 수 없는 분석 오류입니다."))
+                return
+
+            clipped_count = sum(1 for item in result.get("per_frame", []) if item.get("clipped"))
+            messagebox.showinfo(
+                "피봇 분석 완료",
+                (
+                    f"분석 완료: {result.get('analyzed_frames', 0)}프레임\n"
+                    f"건너뜀: {len(result.get('skipped_frames', []))}프레임\n"
+                    f"클리핑 예상: {clipped_count}프레임\n\n"
+                    "분석만 수행했으며 실제 파일은 수정하지 않았습니다."
+                )
+            )
+            show_pivot_analysis_result(path, result, offset_x, offset_y)
+
+        def get_pivot_ui_inputs():
+            sel = get_ase_selection_indices()
+            if not sel:
+                return None, "처리할 Aseprite 파일을 하나 선택해주세요."
+            path = self.aseprite_files[sel[0]]
+            target_layers = [
+                layer_tree.item(item, "values")[2]
+                for item in layer_tree.get_children()
+                if layer_tree.item(item, "values")[1] == "☑"
+            ]
+            if not target_layers:
+                return None, "수정 대상으로 체크된 레이어가 없습니다."
+
+            checked_tags = []
+            if target_frame_mode.get() == "tags":
+                for item in tag_tree.get_children():
+                    values = tag_tree.item(item, "values")
+                    if values[0] == "☑" and values[1] != "태그 없음":
+                        try:
+                            start_text, finish_text = values[2].split("~")
+                            checked_tags.append((int(start_text.strip()), int(finish_text.strip())))
+                        except Exception:
+                            return None, f"태그 프레임 범위를 읽을 수 없습니다: {values[1]}"
+                if not checked_tags:
+                    return None, "체크된 태그 프레임 범위가 없습니다."
+
+            try:
+                offset_x = int(dx_var.get() or 0)
+            except (ValueError, TypeError):
+                offset_x = 0
+            try:
+                offset_y = int(dy_var.get() or 0)
+            except (ValueError, TypeError):
+                offset_y = 0
+            pivot_suffix = (pivot_suffix_var.get().strip() or "_pivot").replace("{dx}", str(offset_x)).replace("{dy}", str(offset_y))
+
+            return {
+                "path": path,
+                "target_layers": target_layers,
+                "target_frame_mode": target_frame_mode.get(),
+                "checked_tags": checked_tags,
+                "offset_x": offset_x,
+                "offset_y": offset_y,
+                "pivot_suffix": pivot_suffix
+            }, None
+
+        def on_apply_pivot_copy():
+            inputs, error = get_pivot_ui_inputs()
+            if error:
+                messagebox.showwarning("피봇 보정 복사본", error)
+                return
+
+            answer = messagebox.askyesno(
+                "피봇 보정 복사본 생성",
+                (
+                    f"원본 파일은 수정하지 않고 {inputs['pivot_suffix']} 복사본으로 저장합니다.\n"
+                    "클리핑이 예상되면 저장하지 않습니다.\n\n"
+                    "진행하시겠습니까?"
+                )
+            )
+            if not answer:
+                return
+
+            result = self.run_aseprite_pivot_apply_copy(
+                inputs["path"],
+                inputs["target_layers"],
+                inputs["target_frame_mode"],
+                inputs["checked_tags"],
+                inputs["offset_x"],
+                inputs["offset_y"],
+                inputs["pivot_suffix"]
+            )
+
+            if not result.get("ok"):
+                detail = result.get("error", "알 수 없는 오류입니다.")
+                if result.get("clipped_blocked"):
+                    clipped_frames = result.get("clipped_frames", [])
+                    sample = ", ".join(str(frame) for frame in clipped_frames[:10])
+                    if len(clipped_frames) > 10:
+                        sample += f" ... 외 {len(clipped_frames) - 10}개"
+                    detail += f"\n\n클리핑 예상 프레임: {sample}"
+                    detail += "\n복사본은 저장되지 않았습니다."
+                messagebox.showerror("피봇 보정 복사본 실패", detail)
+                return
+
+            messagebox.showinfo(
+                "피봇 보정 복사본 완료",
+                (
+                    f"저장된 파일:\n{result.get('output_path')}\n\n"
+                    f"처리 프레임: {result.get('processed_frames', 0)}\n"
+                    f"건너뜀: {len(result.get('skipped_frames', []))}\n"
+                    f"이동한 cel: {result.get('moved_cels', 0)}\n\n"
+                    "원본 파일은 수정하지 않았습니다."
+                )
+            )
+
+        ttk.Button(exec_frame, text="▶ 체크된 파일 레이어 이동 실행", style="Success.TButton", command=on_execute_move).grid(row=0, column=4, rowspan=2, sticky="nsew", padx=10, pady=5)
+        ttk.Button(exec_frame, text="피봇 분석만 실행", command=on_analyze_pivot).grid(row=2, column=4, sticky="nsew", padx=10, pady=(0, 5))
+        ttk.Button(exec_frame, text="피봇 보정 복사본 생성", command=on_apply_pivot_copy).grid(row=3, column=4, sticky="nsew", padx=10, pady=(0, 5))
+        ttk.Label(
+            exec_frame,
+            text="피봇 기능에서는 가로/세로 이동값을 자동 정렬 기준의 X/Y 오프셋으로 해석합니다. 복사본 생성은 원본을 수정하지 않고 _pivot 파일로 저장합니다.",
+            style="Muted.TLabel"
+        ).grid(row=4, column=0, columnspan=5, sticky="w", padx=10, pady=(0, 8))
+
+        # 우측 본문: 레이어/태그 & 미리보기 (좌우 분할)
+        body_split = ttk.PanedWindow(right_frame, orient=tk.HORIZONTAL)
+        body_split.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        
+        move_trees = ttk.Frame(body_split, style="Panel.TFrame")
+        body_split.add(move_trees, weight=1)
+        
+        tree_split = ttk.PanedWindow(move_trees, orient=tk.VERTICAL)
+        tree_split.pack(fill="both", expand=True)
+        
+        # 레이어 선택 트리
+        layer_frame = ttk.LabelFrame(tree_split, text=" 대상 레이어 선택 ")
+        tree_split.add(layer_frame, weight=1)
+        
+        l_scroll = ttk.Scrollbar(layer_frame)
+        l_scroll.pack(side="right", fill="y", pady=(5, 5))
+        
+        layer_tree = ttk.Treeview(layer_frame, columns=("preview", "edit", "path", "vis"), show="headings", yscrollcommand=l_scroll.set, selectmode="none")
+        layer_tree.heading("preview", text="보기")
+        layer_tree.column("preview", width=42, anchor="center", stretch=False)
+        layer_tree.heading("edit", text="수정")
+        layer_tree.column("edit", width=42, anchor="center", stretch=False)
+        layer_tree.heading("path", text="레이어 경로", anchor="w")
+        layer_tree.column("path", width=150, anchor="w", stretch=True)
+        layer_tree.heading("vis", text="상태", anchor="center")
+        layer_tree.column("vis", width=50, anchor="center", stretch=False)
+        layer_tree.pack(side="top", expand=True, fill="both", padx=(5, 0), pady=(5, 5))
+        l_scroll.config(command=layer_tree.yview)
+        
+        def on_layer_click(event):
+            if layer_tree.identify_region(event.x, event.y) != "cell":
+                return
+            column = layer_tree.identify_column(event.x)
+            if column not in ("#1", "#2"):
+                return
+            item = layer_tree.identify_row(event.y)
+            if not item:
+                return
+
+            val = list(layer_tree.item(item, "values"))
+            check_index = 0 if column == "#1" else 1
+            if val[check_index] == "☑":
+                val[check_index] = "☐"
+            elif val[check_index] == "☐":
+                val[check_index] = "☑"
+            else:
+                return
+            layer_tree.item(item, values=tuple(val))
+            if current_ase_path["path"]:
+                save_current_ase_ui_state(current_ase_path["path"])
+            if check_index == 0:
+                invalidate_ase_preview_source()
+                refresh_ase_preview(delay=150)
+
+        layer_tree.bind('<ButtonRelease-1>', on_layer_click)
+        
+        l_btn_f = ttk.Frame(layer_frame, style="Panel.TFrame")
+        l_btn_f.pack(fill="x", padx=5, pady=(0, 5))
+
+        def set_all_layer_checks(check_index, checked):
+            check_value = "☑" if checked else "☐"
+            for item in layer_tree.get_children():
+                val = list(layer_tree.item(item, "values"))
+                val[check_index] = check_value
+                layer_tree.item(item, values=tuple(val))
+            if current_ase_path["path"]:
+                save_current_ase_ui_state(current_ase_path["path"])
+            if check_index == 0:
+                invalidate_ase_preview_source()
+                refresh_ase_preview(delay=150)
+
+        l_btn_f.columnconfigure(0, weight=1)
+        l_btn_f.columnconfigure(1, weight=1)
+        ttk.Button(l_btn_f, text="보기 전체 체크", command=lambda: set_all_layer_checks(0, True)).grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=(0, 2))
+        ttk.Button(l_btn_f, text="보기 전체 해제", command=lambda: set_all_layer_checks(0, False)).grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=(0, 2))
+        ttk.Button(l_btn_f, text="수정 전체 체크", command=lambda: set_all_layer_checks(1, True)).grid(row=1, column=0, sticky="ew", padx=(0, 2))
+        ttk.Button(l_btn_f, text="수정 전체 해제", command=lambda: set_all_layer_checks(1, False)).grid(row=1, column=1, sticky="ew", padx=(2, 0))
+        ttk.Label(
+            layer_frame,
+            text="보기 체크는 미리보기 export에만 반영되며 실제 수정 대상과는 독립적입니다.",
+            style="Muted.TLabel",
+            wraplength=320,
+            justify="left"
+        ).pack(fill="x", padx=7, pady=(0, 5))
+
+        # 태그 선택 트리
+        tag_frame = ttk.LabelFrame(tree_split, text=" 적용 범위 (태그 선택) ")
+        tree_split.add(tag_frame, weight=1)
+        
+        t_scroll = ttk.Scrollbar(tag_frame)
+        t_scroll.pack(side="right", fill="y", pady=(5, 5))
+        
+        tag_tree = ttk.Treeview(tag_frame, columns=("check", "name", "range"), show="headings", yscrollcommand=t_scroll.set, selectmode="none")
+        tag_tree.heading("check", text="체크")
+        tag_tree.column("check", width=40, anchor="center", stretch=False)
+        tag_tree.heading("name", text="태그 이름", anchor="w")
+        tag_tree.column("name", width=100, anchor="w", stretch=True)
+        tag_tree.heading("range", text="프레임 범위", anchor="w")
+        tag_tree.column("range", width=100, anchor="w", stretch=True)
+        tag_tree.pack(side="top", expand=True, fill="both", padx=(5, 0), pady=(5, 5))
+        t_scroll.config(command=tag_tree.yview)
+        
+        t_btn_f = ttk.Frame(tag_frame, style="Panel.TFrame")
+        t_btn_f.pack(fill="x", padx=5, pady=(0, 5))
+        
+        def tag_check_all():
+            for i in tag_tree.get_children():
+                val = tag_tree.item(i, "values")
+                if val[1] != "태그 없음":
+                    tag_tree.item(i, values=("☑", val[1], val[2]))
+            if current_ase_path["path"]: save_current_ase_ui_state(current_ase_path["path"])
+            
+            # Update preview to first tag's first frame
+            for i in tag_tree.get_children():
+                val = tag_tree.item(i, "values")
+                if val[1] != "태그 없음":
+                    try:
+                        rng = val[2].split("~")
+                        f_start = int(rng[0].strip())
+                        current_preview_frame["frame"] = f_start
+                        refresh_ase_preview()
+                    except: pass
+                    break
+
+        def tag_uncheck_all():
+            for i in tag_tree.get_children():
+                val = tag_tree.item(i, "values")
+                if val[1] != "태그 없음":
+                    tag_tree.item(i, values=("☐", val[1], val[2]))
+            if current_ase_path["path"]: save_current_ase_ui_state(current_ase_path["path"])
+
+        ttk.Button(t_btn_f, text="모두 체크", command=tag_check_all).pack(side="left", expand=True, fill="x")
+        ttk.Button(t_btn_f, text="모두 해제", command=tag_uncheck_all).pack(side="left", expand=True, fill="x")
+        
+        t_mode_f = ttk.Frame(tag_frame, style="Panel.TFrame")
+        t_mode_f.pack(fill="x", padx=5, pady=(0, 5))
+        ttk.Radiobutton(t_mode_f, text="모든 프레임", variable=target_frame_mode, value="all").pack(side="left", padx=5)
+        ttk.Radiobutton(t_mode_f, text="체크된 태그만", variable=target_frame_mode, value="tags").pack(side="left", padx=5)
+
+        def on_tag_click(event):
+            region = tag_tree.identify_region(event.x, event.y)
+            if region == "cell":
+                item = tag_tree.identify_row(event.y)
+                if item:
+                    val = tag_tree.item(item, "values")
+                    column = tag_tree.identify_column(event.x)
+                    if column == "#1":
+                        if val[0] == "☑": new_val = ("☐", val[1], val[2])
+                        elif val[0] == "☐": new_val = ("☑", val[1], val[2])
+                        else: return
+                        tag_tree.item(item, values=new_val)
+                        if current_ase_path["path"]: save_current_ase_ui_state(current_ase_path["path"])
+                    
+                    if val[1] != "태그 없음":
+                        try:
+                            rng = val[2].split("~")
+                            f_start = int(rng[0].strip())
+                            current_preview_frame["frame"] = f_start
+                            refresh_ase_preview()
+                        except: pass
+
+        tag_tree.bind('<ButtonRelease-1>', on_tag_click)
+        ttk.Label(tag_frame, text="* 태그 선택/체크 시 해당 태그 첫 프레임 미리보기", style="Muted.TLabel").pack(pady=2)
+
+        # 우측: 큰 미리보기 영역
+        info_frame = ttk.LabelFrame(body_split, text=" 미리보기 ")
+        body_split.add(info_frame, weight=3)
+        
+        info_split = ttk.Frame(info_frame, style="Panel.TFrame")
+        info_split.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        preview_header = ttk.Frame(info_split, style="Panel.TFrame")
+        preview_header.pack(side="top", fill="x", pady=(0, 10))
+
+        info_lbl = ttk.Label(preview_header, text="파일을 선택하세요", justify="left")
+        info_lbl.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+        zoom_controls = ttk.Frame(preview_header, style="Panel.TFrame")
+        zoom_controls.pack(side="right")
+
+        ttk.Button(zoom_controls, text="맞춤", command=lambda: set_preview_zoom("fit")).pack(side="left", padx=1)
+        ttk.Button(zoom_controls, text="1x", command=lambda: set_preview_zoom("manual", 1.0)).pack(side="left", padx=1)
+        ttk.Button(zoom_controls, text="2x", command=lambda: set_preview_zoom("manual", 2.0)).pack(side="left", padx=1)
+        ttk.Button(zoom_controls, text="-", width=3, command=lambda: step_preview_zoom(-1)).pack(side="left", padx=1)
+        ttk.Button(zoom_controls, text="+", width=3, command=lambda: step_preview_zoom(1)).pack(side="left", padx=1)
+
+        zoom_lbl = ttk.Label(zoom_controls, text="배율: 맞춤", style="Muted.TLabel")
+        zoom_lbl.pack(side="left", padx=(8, 0))
+        ttk.Label(zoom_controls, text="Ctrl + 마우스휠: 미리보기 확대/축소", style="Muted.TLabel").pack(side="left", padx=(10, 0))
+        
+        preview_canvas = tk.Canvas(info_split, bg=c["BG_COLOR"], highlightbackground=c["BORDER_COLOR"])
+        preview_canvas.pack(side="top", fill="both", expand=True)
+        preview_canvas.bind("<Control-MouseWheel>", on_preview_mousewheel)
+        preview_canvas.bind("<Configure>", on_preview_canvas_resize)
+
+        # 초기 파일이 있다면 1번 선택 
+        if self.aseprite_files:
+            set_active_ase_index(0)
+            update_inspector()
+            update_expected_label()
+
+        # cleanup temps on close
+        def on_close():
+            if preview_after_id["id"] is not None:
+                try:
+                    ase_win.after_cancel(preview_after_id["id"])
+                except tk.TclError:
+                    pass
+                preview_after_id["id"] = None
+            if preview_resize_after_id["id"] is not None:
+                try:
+                    ase_win.after_cancel(preview_resize_after_id["id"])
+                except tk.TclError:
+                    pass
+                preview_resize_after_id["id"] = None
+            if preview_move_after_id["id"] is not None:
+                try:
+                    ase_win.after_cancel(preview_move_after_id["id"])
+                except tk.TclError:
+                    pass
+                preview_move_after_id["id"] = None
+            if current_preview_source["image"] is not None:
+                try:
+                    current_preview_source["image"].close()
+                except: pass
+                current_preview_source["image"] = None
+            if self.current_preview_temp and os.path.exists(self.current_preview_temp):
+                try:
+                    tmp_dir = os.path.dirname(self.current_preview_temp)
+                    import shutil
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except: pass
+            ase_win.destroy()
+            
+        ase_win.protocol("WM_DELETE_WINDOW", on_close)
+        update_expected_label()
+
+
+
 if __name__ == "__main__":
     try:
+        from tkinterdnd2 import TkinterDnD
         root = TkinterDnD.Tk()
     except Exception as e:
         print("tkinterdnd2 초기화 오류:", e)
+        import tkinter as tk
         root = tk.Tk()
         
     app = PivotFixerApp(root)
